@@ -1,3 +1,23 @@
+linux:
+  label: Linux
+  permalink: /linux
+  description: Linux 内核与系统相关文章
+
+kernel:
+  label: Kernel
+  permalink: /kernel
+  description: Linux 内核开发相关文章
+
+gpio:
+  label: GPIO
+  permalink: /gpio
+  description: GPIO 子系统与驱动相关文章
+
+driver:
+  label: Driver
+  permalink: /driver
+  description: Linux 驱动开发相关文章
+
 facebook:
   label: Facebook
   permalink: /facebook

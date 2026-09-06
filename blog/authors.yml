@@ -1,3 +1,10 @@
+bamboosteps:
+  name: bamboosteps
+  title: 博客作者
+  url: https://github.com/bamboosteps
+  image_url: https://github.com/bamboosteps.png
+  page: true
+
 yangshun:
   name: Yangshun Tay
   title: Ex-Meta Staff Engineer, Co-founder GreatFrontEnd
