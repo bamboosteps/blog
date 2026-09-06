@@ -1,0 +1,123 @@
+---
+slug: light-led-sysfs-chardev
+title: 用 sysfs 与字符设备点亮 LED
+authors: [bamboosteps]
+tags: [linux, kernel, gpio, userspace, led-series]
+description: 不编写任何内核代码,分别用 sysfs 接口和字符设备(chardev)接口从用户态控制 GPIO 点亮 LED,基于 Linux 4.9。
+---
+
+本文是["Linux GPIO 控制方式概览"](/blog/linux-gpio-control-overview)系列的第二篇。这两种方式都不需要编写内核代码,操作的是系统里已经由某个 GPIO 控制器驱动注册好的引脚。
+
+{/* truncate */}
+
+## 前提条件
+
+假定目标板上有一个 GPIO 控制器已经完成注册,其中编号(全局编号,即 debugfs 里看到的编号)为 `17` 的引脚外接一个 LED:引脚输出高电平时 LED 点亮,输出低电平时熄灭。具体的全局编号需要通过 `cat /sys/kernel/debug/gpio` 或 `gpioinfo` 在目标板上确认,不同硬件上的编号并不相同。
+
+## 方式一:sysfs 接口
+
+sysfs 接口通过 `/sys/class/gpio` 下的一组文件操作 GPIO,需要内核开启 `CONFIG_GPIO_SYSFS`。
+
+```bash
+# 导出编号为 17 的 GPIO,导出后会出现 /sys/class/gpio/gpio17 目录
+echo 17 > /sys/class/gpio/export
+
+# 设置方向为输出
+echo out > /sys/class/gpio/gpio17/direction
+
+# 输出高电平,点亮 LED
+echo 1 > /sys/class/gpio/gpio17/value
+
+# 输出低电平,熄灭 LED
+echo 0 > /sys/class/gpio/gpio17/value
+
+# 使用完毕后取消导出
+echo 17 > /sys/class/gpio/unexport
+```
+
+该接口自 Linux 4.8 起已在内核文档中标记为 deprecated,原因包括:编号由内核动态分配、不同板卡间不保证一致;`export`/`unexport` 缺乏原子性,多个进程并发访问容易出现竞态;无法在一次系统调用中操作多个引脚。4.9 内核仍然保留该接口,但不建议在新项目中使用,这里仅作为对比说明。
+
+## 方式二:字符设备接口
+
+字符设备接口通过 `/dev/gpiochipN` 提供,基于 `ioctl()` 系统调用,对应的用户态数据结构定义在 `include/uapi/linux/gpio.h`(Linux 4.8 引入,4.9 已包含)。
+
+### 用命令行工具快速验证
+
+`libgpiod` 是一套独立于内核发布的用户态工具与库,提供了对该接口的封装,常见命令包括:
+
+```bash
+gpiodetect              # 列出系统中的 gpiochip 设备
+gpioinfo gpiochip0       # 查看该 chip 下每个引脚的编号、方向、占用情况
+gpioget gpiochip0 17     # 读取 17 号引脚的电平
+gpioset gpiochip0 17=1   # 将 17 号引脚设置为高电平
+```
+
+`libgpiod` 需要单独编译安装,不随内核源码提供。
+
+### 直接使用 ioctl 接口
+
+不依赖 `libgpiod`,也可以直接调用底层 ioctl 完成同样的操作。以下代码基于 Linux 4.9 的 `include/uapi/linux/gpio.h`,请求 17 号引脚为输出并写入电平:
+
+```c
+// led_chardev.c
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/gpio.h>
+
+int main(void)
+{
+    struct gpiohandle_request req;
+    struct gpiohandle_data data;
+    int chip_fd, ret;
+
+    chip_fd = open("/dev/gpiochip0", O_RDONLY);
+    if (chip_fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.lineoffsets[0] = 17;
+    req.flags = GPIOHANDLE_REQUEST_OUTPUT;
+    req.default_values[0] = 0;
+    req.lines = 1;
+    strncpy(req.consumer_label, "led-demo", sizeof(req.consumer_label) - 1);
+
+    ret = ioctl(chip_fd, GPIO_GET_LINEHANDLE_IOCTL, &req);
+    if (ret < 0) {
+        perror("GPIO_GET_LINEHANDLE_IOCTL");
+        close(chip_fd);
+        return 1;
+    }
+    close(chip_fd); /* 已经拿到 req.fd,可以关闭 chip 本身的 fd */
+
+    /* 点亮 LED */
+    data.values[0] = 1;
+    ioctl(req.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+
+    sleep(1);
+
+    /* 熄灭 LED */
+    data.values[0] = 0;
+    ioctl(req.fd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
+
+    close(req.fd);
+    return 0;
+}
+```
+
+关键步骤说明:
+
+1. **打开 `/dev/gpiochipN`**:每个 `gpio_chip` 对应一个字符设备节点,`N` 与 debugfs 里看到的 `gpiochipN` 一致。
+2. **`GPIO_GET_LINEHANDLE_IOCTL`**:填写 `gpiohandle_request` 结构体,声明要操作的引脚偏移(`lineoffsets`,即该 chip 内部的局部编号,不是全局编号)、方向标志(`GPIOHANDLE_REQUEST_OUTPUT` 或 `GPIOHANDLE_REQUEST_INPUT`)、初始电平(`default_values`),调用成功后内核在 `req.fd` 中返回一个新的文件描述符,后续所有读写都通过这个 `fd` 进行,与最初打开的 chip fd 无关。
+3. **`GPIOHANDLE_SET_LINE_VALUES_IOCTL`**:传入 `gpiohandle_data` 结构体设置电平。读取电平使用 `GPIOHANDLE_GET_LINE_VALUES_IOCTL`,结构体相同。
+4. 进程退出或关闭 `req.fd` 后,内核会自动释放该引脚的占用。
+
+`gpiohandle_request` 中的 `lineoffsets` 是相对于所打开的 `gpiochipN` 的**局部偏移**,而 sysfs 使用的是**全局编号**,两者不能直接混用,需要通过 `gpioinfo` 或 debugfs 确认对应关系。
+
+## 小结
+
+sysfs 和字符设备两种方式都不涉及内核代码编写,区别在于:sysfs 是遗留接口,已不建议用于新项目;字符设备接口是当前推荐的用户态访问方式,既可以通过 `libgpiod` 提供的命令行工具/库使用,也可以直接调用 ioctl。下一篇将介绍另一条路线——[编写 gpiolib 驱动点亮 LED](/blog/light-led-gpiolib-driver)。

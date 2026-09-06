@@ -1,3 +1,13 @@
+led-series:
+  label: 点亮 LED 系列
+  permalink: /led-series
+  description: 以点亮一个 LED 为例,介绍 Linux 下几种不同的 GPIO 控制方式
+
+userspace:
+  label: 用户态
+  permalink: /userspace
+  description: 不需要编写内核代码、直接从用户态完成的操作
+
 linux:
   label: Linux
   permalink: /linux
