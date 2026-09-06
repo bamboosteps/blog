@@ -1,7 +1,7 @@
 ---
 sidebar_position: 10
 title: 常用内核写法速查
-description: LED / I2C / SPI 各篇驱动代码里反复出现的内核写法,按内存操作、错误处理、驱动注册、并发控制、数据传递分类速查,各篇代码后面只放跳转链接。
+description: LED / I2C / SPI 各篇驱动代码里反复出现的内核写法,按内存操作、错误处理、驱动注册、并发控制、数据传递分类速查。
 ---
 
 ## 内存与结构体操作
@@ -31,19 +31,16 @@ struct simple_gpio {
 #define offsetof(TYPE, MEMBER) ((size_t)&((TYPE *)0)->MEMBER)
 ```
 
-`container_of(gc, struct simple_gpio, chip)` 用 `gc` 的地址减去 `chip` 在 `simple_gpio` 里的偏移量,得到 `simple_gpio` 结构体的起始地址:
+`sg = container_of(gc, struct simple_gpio, chip)` 用 `gc` 的地址减去 `chip` 在 `simple_gpio` 里的偏移量,得到 `simple_gpio` 结构体的起始地址:
 
 ```text
-simple_gpio 内存布局                  gc 指向 chip 成员
-┌─────────────────────────┐  offset 0
-│ struct gpio_chip chip    │ ◄── gc
-├─────────────────────────┤  offset N
-│ void __iomem *base       │
-├─────────────────────────┤
-│ spinlock_t lock          │
+┌─────────────────────────┐  ◄── offset 0
+│ struct gpio_chip chip   │  
+├─────────────────────────┤  ◄── gc  
+│ void __iomem *base      │
+├─────────────────────────┤  ◄── offset N
+│ spinlock_t lock         │
 └─────────────────────────┘  ◄── sg(= container_of(gc, ..., chip))
-
-chip 是第一个成员 → offset = 0 → sg 与 gc 数值相等
 ```
 
 `chip` 是第一个成员,偏移量为 0,`gc` 与 `sg` 数值相等;若目标成员排在后面(例如 I2C/SPI 驱动里的 `miscdev` 是第二个成员),偏移量非 0,减法才真正生效。
@@ -69,7 +66,7 @@ chip 是第一个成员 → offset = 0 → sg 与 gc 数值相等
 
 ### probe() 触发机制 {/* #probe */}
 
-`probe()` 由内核的设备-驱动匹配机制触发,不是被直接调用:注册驱动 → 总线核心比对设备与驱动的匹配表 → 匹配上则调用 `.probe`。三条总线的差异:
+`probe()` 由内核的设备-驱动匹配机制触发,不是被直接调用:注册驱动、总线核心比对设备与驱动的匹配表、匹配上则调用 `.probe`。三条总线的差异:
 
 | 总线 | 设备对象 | 注册触发 | 匹配顺序 | `.probe` 签名 |
 |---|---|---|---|---|
@@ -117,7 +114,7 @@ module_xxx_driver() → xxx_register_driver()
 
 自旋锁保护"读-改-写寄存器"操作不被并发打断。`irqsave`/`irqrestore` 后缀表示加锁前保存当前中断使能状态、解锁后恢复,使这段代码即便在中断关闭的场景下执行也不会死锁或永久关闭中断。
 
-:::caution 并发覆盖风险
+:::caution[并发覆盖风险]
 两个 CPU 同时调用 `simple_gpio_set()` 操作不同的位,若不加锁,后写入的一次可能覆盖前一次的结果。
 :::
 
@@ -137,7 +134,7 @@ module_xxx_driver() → xxx_register_driver()
    调用填在 .read 里的驱动函数
 ```
 
-:::tip *ppos 的 EOF 处理
+:::tip[`*ppos` 的 EOF 处理]
 `*ppos` 是文件当前读写位置;读到末尾后再次 `read()` 应返回 `0`(EOF),避免用户重复读到同一份数据。
 :::
 
@@ -146,12 +143,12 @@ module_xxx_driver() → xxx_register_driver()
 内核态与用户态地址空间不同,驱动不能直接解引用用户态传入的指针:
 
 ```text
-内核缓冲区 kernel_buf                用户缓冲区 user_ptr
-      │── copy_to_user(user_ptr, kernel_buf, len) ──►│
-      │◄── copy_from_user(kernel_buf, user_ptr, len) ──│
+│内核缓冲区 kernel_buf         用户缓冲区 user_ptr│
+│── copy_to_user(user_ptr, kernel_buf, len)   ──►│
+│◄── copy_from_user(kernel_buf, user_ptr, len) ──│
 ```
 
-:::danger 直接解引用用户指针的风险
+:::danger[直接解引用用户指针的风险]
 内核态代码直接读写用户态指针可能导致内核崩溃或绕过权限检查;必须通过 `copy_to_user`/`copy_from_user` 传递数据。
 :::
 

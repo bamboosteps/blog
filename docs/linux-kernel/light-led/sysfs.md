@@ -1,58 +1,56 @@
 ---
 sidebar_position: 2
-title: sysfs 接口
-description: 编写一个最小的 GPIO 控制器驱动(provider),通过 sysfs 接口验证驱动、点亮 LED,基于 Linux 4.9。
+title: sysfs 接口点亮 LED
+description: gpiolib 为每个注册成功的 gpio_chip 自动提供 sysfs 接口,本文实现一个最小 GPIO 控制器驱动并通过 sysfs 验证,基于 Linux 4.9。
 ---
 
-## 核心概念
+sysfs 接口(`/sys/class/gpio`)不是独立驱动,而是 gpiolib 为每一个注册成功的 `gpio_chip` 自动提供的功能,由 `CONFIG_GPIO_SYSFS` 控制。控制器驱动只需调用 `gpiochip_add_data()` 完成注册,sysfs 节点即自动出现。
 
-sysfs 接口(`/sys/class/gpio`)不是一个独立的驱动,而是 gpiolib 为每一个注册成功的 `gpio_chip` 自动提供的功能,由 `CONFIG_GPIO_SYSFS` 控制:只要驱动调用 `gpiochip_add_data()` 完成注册,sysfs 节点就会自动出现,不需要控制器驱动的作者额外写代码。写 `value` 文件 → `value_store()` → `gpiod_set_value_cansleep()` → `chip->set()`,sysfs 只是一层文件系统包装,真正改变引脚电平的仍然是驱动自己实现的 `set` 回调。
-
-:::tip 前置条件
+:::tip[前置条件]
 编译前在 `menuconfig` 中开启 `CONFIG_GPIOLIB`、`CONFIG_OF_GPIO`、`CONFIG_GPIO_SYSFS`,并准备 Linux 4.9 源码树和支持设备树的开发板。
 :::
 
-## 编写驱动
+## 架构与调用机制
 
-以下驱动针对一个假想的内存映射 GPIO 控制器:占用 8 字节寄存器空间,映射在物理地址 `0x10000000`,偏移 `0x00` 为数据寄存器、`0x04` 为方向寄存器(对应位为 1 表示输出),共管理 8 根引脚。
+写 `value` 文件到寄存器电平变化的完整路径:
 
-### 分析调用链
+```text
+用户态 echo 1 > .../value
+        │
+        ▼
+value_store()              drivers/gpio/gpiolib-sysfs.c
+        │
+        ▼
+gpiod_set_value_cansleep() drivers/gpio/gpiolib.c
+        │
+        ▼
+chip->set(chip, offset, value)   控制器驱动实现的回调
+        │
+        ▼
+写寄存器,引脚电平变化
+```
 
-以 Linux 4.9 的实现(`drivers/gpio/gpiolib-sysfs.c`)为例,几个关键文件对应的处理函数是:
+sysfs 只是一层文件系统包装,真正改变引脚电平的仍是驱动自己实现的 `set` 回调。
 
 | sysfs 文件 | 处理函数 | 内部调用 |
 |---|---|---|
-| `export`(写) | `export_store()` | `gpio_to_desc()` 校验编号,再 `gpiod_request()` 占用该引脚 |
+| `export`(写) | `export_store()` | `gpio_to_desc()` 校验编号,`gpiod_request()` 占用引脚 |
 | `gpioN/direction`(写) | `direction_store()` | `gpiod_direction_output_raw()` 或 `gpiod_direction_input()` |
 | `gpioN/value`(读/写) | `value_show()` / `value_store()` | `gpiod_get_value_cansleep()` / `gpiod_set_value_cansleep()` |
 
-这几个 `gpiod_*` 函数定义在 `drivers/gpio/gpiolib.c` 中,最终都会落到 `gpio_chip` 自己实现的回调上:
+以上 `gpiod_*` 函数最终都落到 `gpio_chip` 自己实现的回调上:
 
 ```c
-// drivers/gpio/gpiolib.c(节选,函数名与参数为实际内核源码)
+// drivers/gpio/gpiolib.c(节选)
 err = chip->direction_input(chip, offset);
 err = chip->direction_output(chip, offset, value);
 chip->set(chip, offset, value);
 value = chip->get(chip, offset);
 ```
 
-### 填写 gpio_chip 字段
+## 配置设备树节点
 
-| 字段 | 类型 | 作用 |
-|---|---|---|
-| `label` | `const char *` | 控制器名称,显示在 debugfs 中 |
-| `parent` | `struct device *` | 对应的物理设备 |
-| `owner` | `struct module *` | 一般填 `THIS_MODULE` |
-| `base` | `int` | 起始全局编号,填 `-1` 表示由内核自动分配 |
-| `ngpio` | `u16` | 该控制器管理的引脚数量 |
-| `get_direction` | 函数指针 | 查询引脚方向 |
-| `direction_input` | 函数指针 | 设置引脚为输入 |
-| `direction_output` | 函数指针 | 设置引脚为输出并给定初始电平 |
-| `get` | 函数指针 | 读取引脚电平 |
-| `set` | 函数指针 | 设置引脚电平 |
-| `of_node` | `struct device_node *` | 对应的设备树节点 |
-
-### 编写设备树节点
+目标是一个假想的内存映射 GPIO 控制器:占用 8 字节寄存器空间,映射在物理地址 `0x10000000`,偏移 `0x00` 为数据寄存器、`0x04` 为方向寄存器(对应位为 1 表示输出),共管理 8 根引脚。
 
 ```dts
 simple_gpio: gpio@10000000 {
@@ -63,9 +61,43 @@ simple_gpio: gpio@10000000 {
 };
 ```
 
-`gpio-controller` 是一个空属性,标记该节点是一个 GPIO 控制器。`#gpio-cells` 声明消费者引用该控制器时需要提供几个参数,惯例为 `2`:引脚偏移 + 极性标志。
+| 属性 | 值 | 说明 |
+|---|---|---|
+| `compatible` | `"example,simple-gpio"` | 匹配驱动 `of_match_table` |
+| `reg` | `<0x10000000 0x8>` | 寄存器物理地址与长度 |
+| `gpio-controller` | 空属性 | 标记该节点是一个 GPIO 控制器 |
+| `#gpio-cells` | `<2>` | 消费者引用时需提供的参数个数:引脚偏移 + 极性标志 |
 
-### 实现驱动代码
+## 驱动程序实现
+
+`struct gpio_chip` 必须填写的字段(定义于 `include/linux/gpio/driver.h`):
+
+| 字段 | 类型 | 作用 |
+|---|---|---|
+| `label` | `const char *` | 控制器名称,显示在 debugfs 中 |
+| `parent` | `struct device *` | 对应的物理设备 |
+| `owner` | `struct module *` | 一般填 `THIS_MODULE` |
+| `base` | `int` | 起始全局编号,`-1` 表示由内核自动分配 |
+| `ngpio` | `u16` | 该控制器管理的引脚数量 |
+| `get_direction` | 函数指针 | 查询引脚方向 |
+| `direction_input` | 函数指针 | 设置引脚为输入 |
+| `direction_output` | 函数指针 | 设置引脚为输出并给定初始电平 |
+| `get` | 函数指针 | 读取引脚电平 |
+| `set` | 函数指针 | 设置引脚电平 |
+| `of_node` | `struct device_node *` | 对应的设备树节点 |
+
+`probe()` 阶段执行顺序:
+
+```text
+simple_gpio_probe(pdev)
+    │
+    ├─ devm_kzalloc()                          → 分配私有结构体 sg
+    ├─ platform_get_resource() + devm_ioremap_resource() → 映射寄存器到 sg->base
+    ├─ spin_lock_init()
+    ├─ 填充 sg->chip 各字段(direction_input/output、get、set ...)
+    ├─ platform_set_drvdata(pdev, sg)
+    └─ devm_gpiochip_add_data(dev, &sg->chip, sg)  → 注册进 gpiolib,自动创建 sysfs 节点
+```
 
 <details>
 <summary>Show code</summary>
@@ -221,58 +253,11 @@ MODULE_DESCRIPTION("Minimal example GPIO controller driver");
 
 </details>
 
-### 梳理执行流程
+:::tip[寄存器写顺序]
+`direction_output` 中先写数据寄存器、再写方向寄存器,避免切换瞬间输出上一次遗留的电平。`chip.base = -1` 表示编号由内核自动分配,避免与系统里其他 GPIO 控制器的编号段冲突。
+:::
 
-```
-insmod gpio-simple-demo.ko
-        │
-        ▼
-module_platform_driver() 展开的 module_init()
-        │
-        ▼
-platform_driver_register(&simple_gpio_driver)
-        │
-        ▼
-platform 总线按 compatible = "example,simple-gpio" 匹配设备树节点
-        │
-        ▼
-simple_gpio_probe(pdev) 被调用
-        │
-        ├─ devm_kzalloc()                            分配私有结构体 sg
-        ├─ platform_get_resource() + devm_ioremap_resource()   映射寄存器 → sg->base
-        ├─ spin_lock_init()
-        ├─ 依次填好 sg->chip 的各个字段(direction_input/output、get、set ...)
-        ├─ platform_set_drvdata(pdev, sg)
-        └─ devm_gpiochip_add_data(dev, &sg->chip, sg) → 注册进 gpiolib
-                    │
-                    ▼
-        gpiolib 自动创建 /sys/class/gpio/gpioN 节点
-                    │
-        用户态 echo 写 direction / value 文件
-                    │
-                    ▼
-        gpiolib 调用 sg->chip 的 direction_output / set / get 回调
-```
-
-`sg->chip.base = -1` 表示编号由内核自动分配,避免和系统里其他 GPIO 控制器的编号段冲突;`direction_output` 里先写数据寄存器、再写方向寄存器,避免切换瞬间输出上一次遗留的电平。
-
-### 对照相关写法
-
-流程图里几个关键函数/宏的原理统一放在了[《常用内核写法速查》](../kernel-code-reference.md)里,这里只列出对应链接:
-
-- [`container_of`](../kernel-code-reference.md#container-of)
-- [`probe()` 触发机制(platform 总线)](../kernel-code-reference.md#probe)
-- [`devm_kzalloc` / `devm_ioremap_resource`](../kernel-code-reference.md#devm)
-- [`IS_ERR` / `PTR_ERR`](../kernel-code-reference.md#is-err-ptr-err)
-- [`spin_lock_irqsave` / `spin_unlock_irqrestore`](../kernel-code-reference.md#spin-lock)
-- [`MODULE_DEVICE_TABLE`](../kernel-code-reference.md#module-device-table)
-- [`platform_set_drvdata` / `platform_get_drvdata`](../kernel-code-reference.md#set-drvdata)
-
-## 编译并加载驱动
-
-```makefile
-obj-m += gpio-simple-demo.o
-```
+## 验证与控制
 
 ```bash
 make -C /path/to/linux-4.9 M=$(pwd) modules
@@ -280,11 +265,7 @@ insmod gpio-simple-demo.ko
 dmesg | tail
 ```
 
-## 点亮 LED
-
-驱动加载成功后,用 `cat /sys/kernel/debug/gpio` 确认分配到的全局编号(以下假设是 `17`,对应设备树中第 3 号引脚外接的 LED)。sysfs 本质上就是普通文件,命令行的 `echo`/`cat` 和代码里的 `open()`/`write()` 操作的是同一组文件,只是调用方式不同。
-
-### 运行命令行工具
+驱动加载成功后,用 `cat /sys/kernel/debug/gpio` 确认分配到的全局编号(以下假设是 `17`,对应设备树中第 3 号引脚外接的 LED)。
 
 <details>
 <summary>Show code</summary>
@@ -308,9 +289,7 @@ echo 17 > /sys/class/gpio/unexport
 
 </details>
 
-### 编写用户态程序
-
-`echo x > file` 在 shell 里等价于 `open(file, O_WRONLY)` 后 `write()` 写入字符串 `x`,用 C 代码实现同样的流程:
+`echo x > file` 在 shell 里等价于 `open(file, O_WRONLY)` 后 `write()` 写入字符串 `x`,以下 C 代码实现同样的流程:
 
 <details>
 <summary>Show code</summary>
@@ -370,10 +349,10 @@ int main(void)
 
 </details>
 
-:::caution export/unexport 不能省略
+:::caution[`export`/`unexport` 不能省略]
 `export`/`unexport` 写入的是 `/sys/class/gpio` 顶层的两个文件,不是每个 GPIO 独立一份。省略这两次调用会导致后续对 `gpio17/direction`、`gpio17/value` 的 `open()` 因为目录不存在而返回 `-ENOENT`。
 :::
 
-:::caution sysfs 接口已被标记为 deprecated
-原因包括:编号由内核动态分配、不同板卡间不保证一致;`export`/`unexport` 缺乏原子性;无法在一次系统调用中操作多个引脚。4.9 内核仍保留该接口,但不建议在新项目中使用。
+:::caution[sysfs 接口已被标记为 `deprecated`]
+编号由内核动态分配、不同板卡间不保证一致;`export`/`unexport` 缺乏原子性;无法在一次系统调用中操作多个引脚。4.9 内核仍保留该接口,但不建议在新项目中使用。
 :::

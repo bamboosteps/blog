@@ -1,16 +1,36 @@
 ---
 sidebar_position: 3
-title: i2c_driver 驱动
-description: 编写一个 i2c_driver 客户端驱动,读取从设备的一个寄存器,并通过字符设备暴露给用户态,基于 Linux 4.9。
+title: i2c_driver 驱动封装寄存器
+description: 编写一个 i2c_driver 客户端驱动,用 i2c_smbus_read_byte_data 封装单字节寄存器读取,通过字符设备暴露给用户态,基于 Linux 4.9。
 ---
 
-## 核心概念
+`i2c_driver` 是内核态的客户端驱动框架:`struct i2c_driver` 填写 `probe()`/`remove()` 和匹配表,用 `module_i2c_driver()` 注册;`probe()` 拿到的 `struct i2c_client` 已带有地址、所属 adapter 等信息。以下驱动针对地址 `0x50`、寄存器 `0x00` 为 8 位只读状态寄存器的从设备,把"读这个寄存器"封装成一个字符设备。
 
-`i2c_driver` 是内核态的客户端驱动框架。`struct i2c_driver` 填写 `probe()`/`remove()` 和匹配表(`id_table` 或设备树 `of_match_table`),用 `i2c_add_driver()` / `module_i2c_driver()` 注册;`probe()` 的参数是 `struct i2c_client`,已经带有地址、所属 adapter 等信息,不需要驱动自己再指定地址;单字节寄存器读写最常用 `i2c_smbus_read_byte_data(client, reg)` / `i2c_smbus_write_byte_data(client, reg, val)`,省去手动拼 `i2c_msg` 的过程,底层仍通过 adapter 的 `master_xfer` 完成收发。以下驱动针对地址 `0x50`、寄存器 `0x00` 为 8 位只读状态寄存器的从设备,把"读这个寄存器"封装成一个字符设备。
+## 架构与调用机制
 
-## 编写驱动
+```text
+用户态 read(fd, buf, 1)
+        │
+        ▼
+VFS → file_operations.read = demo_sensor_read()
+        │
+        ▼
+i2c_smbus_read_byte_data(client, REG_STATUS)
+        │
+        ▼
+adapter->algo->master_xfer()   总线控制器实际收发
+        │
+        ▼
+copy_to_user()   拷贝结果回用户态缓冲区
+```
 
-### 编写设备树节点
+| 内核对象 | 定位 |
+|---|---|
+| `struct i2c_client` | `probe()` 的参数,已含从设备地址、所属 adapter,不需要驱动指定地址 |
+| `i2c_smbus_read_byte_data(client, reg)` | 单字节寄存器读,省去手动拼 `i2c_msg` |
+| `i2c_smbus_write_byte_data(client, reg, val)` | 单字节寄存器写 |
+
+## 配置设备树节点
 
 ```dts
 &i2c1 {
@@ -23,9 +43,22 @@ description: 编写一个 i2c_driver 客户端驱动,读取从设备的一个寄
 };
 ```
 
-`reg` 是从设备的 7 位地址,`i2c_client` 会自动携带这个地址,不需要在驱动代码里硬编码。
+| 属性 | 值 | 说明 |
+|---|---|---|
+| `compatible` | `"example,demo-sensor"` | 匹配驱动 `of_match_table` |
+| `reg` | `<0x50>` | 从设备 7 位地址,`i2c_client` 自动携带,驱动代码里不需要硬编码 |
 
-### 实现驱动代码
+## 驱动程序实现
+
+```text
+demo_sensor_probe(client, id)
+    │
+    ├─ devm_kzalloc()                → 分配私有结构体 sensor
+    ├─ sensor->client = client
+    ├─ 填充 miscdev(minor / name / fops)
+    ├─ i2c_set_clientdata(client, sensor)
+    └─ misc_register(&sensor->miscdev)  → 创建 /dev/demo-sensor
+```
 
 <details>
 <summary>Show code</summary>
@@ -136,69 +169,17 @@ MODULE_DESCRIPTION("Minimal example I2C client driver");
 
 </details>
 
-### 梳理执行流程
+:::tip[`id_table` 与 `of_match_table` 都要写]
+两条匹配路径相互独立:走设备树的板卡靠 `of_match_table` 匹配,走传统 `i2c_board_info` 静态注册的板卡靠 `id_table` 匹配,4.9 内核建议两个都写。
+:::
 
-驱动加载时的注册流程:
-
-```
-insmod i2c-demo-sensor.ko
-        │
-        ▼
-module_i2c_driver() → i2c_add_driver()
-        │
-        ▼
-I2C 核心按 compatible/id_table 匹配设备树里的 sensor@50
-        │
-        ▼
-demo_sensor_probe(client, id) 被调用
-        │
-        ├─ devm_kzalloc()                     分配私有结构体 sensor
-        ├─ sensor->client = client
-        ├─ 填充 miscdev(minor / name / fops)
-        ├─ i2c_set_clientdata(client, sensor)
-        └─ misc_register(&sensor->miscdev) → 创建 /dev/demo-sensor
-```
-
-用户态读取时的调用流程:
-
-```
-用户态 read(fd, buf, 1)
-        │
-        ▼
-VFS 根据 file_operations 调用 demo_sensor_read()
-        │
-        ▼
-i2c_smbus_read_byte_data(sensor->client, REG_STATUS)
-        │
-        ▼
-adapter->algo->master_xfer()   实际的 I2C 总线收发
-        │
-        ▼
-copy_to_user()   把结果拷贝回用户态缓冲区
-```
-
-### 对照相关写法
-
-流程图里几个关键函数/宏的原理统一放在了[《常用内核写法速查》](../kernel-code-reference.md)里,这里只列出对应链接:
-
-- [`container_of`](../kernel-code-reference.md#container-of)(这里反推的是 `miscdev`,它是 `demo_sensor` 的第二个成员,偏移量不是 0)
-- [`probe()` 触发机制(I2C 总线)](../kernel-code-reference.md#probe)
-- [`struct file_operations` / `.read`](../kernel-code-reference.md#file-operations)
-- [`copy_to_user`](../kernel-code-reference.md#copy-to-user)
-- [`i2c_set_clientdata` / `i2c_get_clientdata`](../kernel-code-reference.md#set-drvdata)
-- [`MISC_DYNAMIC_MINOR` / `misc_register`](../kernel-code-reference.md#misc-device)
-
-`i2c_device_id` 和 `of_match_table` 是两条独立的匹配路径,4.9 内核建议两个都写:走设备树的板卡靠前者匹配,走传统 `i2c_board_info` 静态注册的板卡靠后者匹配。
-
-## 读取传感器状态
+## 验证与控制
 
 驱动加载并 probe 成功后,`/dev/demo-sensor` 节点自动出现,用户态不需要知道背后是哪个 I2C 地址、哪个寄存器:
 
 ```bash
 cat /dev/demo-sensor | xxd
 ```
-
-或者用 C 代码:
 
 <details>
 <summary>Show code</summary>
@@ -231,5 +212,3 @@ int main(void)
 ```
 
 </details>
-
-对比[i2c-dev 接口](./i2c-dev.md):那里的应用需要知道总线号、从设备地址、寄存器编号;这里的应用只需要 `open()` + `read()` 一个语义明确的设备节点,寄存器细节被封装在驱动里,这正是编写客户端驱动的意义所在。
