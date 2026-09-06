@@ -1,0 +1,8 @@
+{
+  "label": "LED",
+  "position": 1,
+  "link": {
+    "type": "doc",
+    "id": "linux-kernel/light-led/overview"
+  }
+}

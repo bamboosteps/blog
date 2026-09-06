@@ -1,0 +1,8 @@
+{
+  "label": "SPI",
+  "position": 3,
+  "link": {
+    "type": "doc",
+    "id": "linux-kernel/spi/overview"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "label": "I2C",
+  "position": 2,
+  "link": {
+    "type": "doc",
+    "id": "linux-kernel/i2c/overview"
+  }
+}

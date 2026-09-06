@@ -1,0 +1,9 @@
+{
+  "label": "Linux Kernel",
+  "position": 4,
+  "link": {
+    "type": "generated-index",
+    "slug": "/linux-kernel",
+    "description": "Linux 内核相关的驱动开发笔记。"
+  }
+}
